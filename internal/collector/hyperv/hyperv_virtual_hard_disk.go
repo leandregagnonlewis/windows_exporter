@@ -210,7 +210,8 @@ func (c *Collector) buildVirtualHardDisk(miSession *mi.Session) error {
 	}
 	c.vmQuery = vmQuery
 
-	storageQuery, err := mi.NewQuery("SELECT InstanceID, HostResource, Address, AddressOnParent, ResourceType, ResourceSubType FROM Msvm_StorageAllocationSettingData WHERE HostResource LIKE '%.vhd%'")
+	// Simpler storage query without LIKE operator that may not be supported
+	storageQuery, err := mi.NewQuery("SELECT InstanceID, HostResource, Address, AddressOnParent, ResourceType, ResourceSubType FROM Msvm_StorageAllocationSettingData")
 	if err != nil {
 		return fmt.Errorf("failed to create storage query: %w", err)
 	}
@@ -282,6 +283,21 @@ func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 
 	// Process each storage instance
 	for _, storage := range storageData {
+		// Skip storage instances that don't have VHD files
+		hasVHD := false
+		for _, hostResource := range storage.HostResource {
+			if hostResource != "" && 
+			   (strings.HasSuffix(strings.ToLower(hostResource), ".vhdx") || 
+			    strings.HasSuffix(strings.ToLower(hostResource), ".vhd")) {
+				hasVHD = true
+				break
+			}
+		}
+		
+		if !hasVHD {
+			continue
+		}
+
 		// Find which VM this storage belongs to
 		var vmName string
 		var vmInstanceID string
