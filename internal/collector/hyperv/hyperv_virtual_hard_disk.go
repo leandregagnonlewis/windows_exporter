@@ -212,8 +212,8 @@ func (c *Collector) buildVirtualHardDisk(miSession *mi.Session) error {
 	c.vmQuery = vmQuery
 
 	// Simpler storage query without LIKE operator that may not be supported
-	var testVMs []miVirtualSystemSettingData
-	storageQuery := wmi.CreateQuery("testVMS", "Parent IS NOT NULL", "VirtualSystemSettingData")
+	var testVMs []miStorageAllocationSettingData
+	storageQuery := wmi.CreateQuery(testVMs, "WHERE Parent IS NOT NULL", "Msvm_StorageAllocationSettingData")
 	c.storageQuery = storageQuery
 
 	// Test the queries to make sure they work - following cpu_info.go pattern
