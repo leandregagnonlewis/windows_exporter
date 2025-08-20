@@ -20,10 +20,13 @@ package hyperv
 import (
 	"fmt"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
+	"github.com/Microsoft/go-winio/vhd"
 	"github.com/prometheus-community/windows_exporter/internal/mi"
 	"github.com/prometheus-community/windows_exporter/internal/types"
 	"github.com/prometheus/client_golang/prometheus"
@@ -33,9 +36,6 @@ import (
 // collectorVirtualHardDisk Hyper-V Virtual Hard Disk metrics
 type collectorVirtualHardDisk struct {
 	miSession *mi.Session
-
-	// WMI session for persistent connection
-	wmiClient *wmi.SWbemServices
 
 	// MI queries
 	vmQuery      mi.Query
@@ -99,6 +99,19 @@ type miVirtualHardDiskState struct {
 	IsPMEMCompatible        bool   `mi:"IsPMEMCompatible"`
 }
 
+// VHDInfo contains information about a VHD file extracted using go-winio/vhd package
+type VHDInfo struct {
+	Path                    string
+	VirtualSize             uint64
+	PhysicalSize            uint64
+	BlockSize               uint32
+	LogicalSectorSize       uint32
+	PhysicalSectorSize      uint32
+	VHDType                 string
+	VHDFormat               string
+	FragmentationPercentage uint16
+}
+
 func (c *Collector) buildVirtualHardDisk(miSession *mi.Session) error {
 	if miSession == nil {
 		return fmt.Errorf("miSession is nil")
@@ -106,13 +119,6 @@ func (c *Collector) buildVirtualHardDisk(miSession *mi.Session) error {
 
 	// Store the MI session for use in collection
 	c.miSession = miSession
-
-	// Initialize persistent WMI client for Hyper-V namespace
-	wmiClient, err := wmi.InitializeSWbemServices(wmi.DefaultClient, "root/virtualization/v2")
-	if err != nil {
-		return fmt.Errorf("failed to initialize WMI client: %w", err)
-	}
-	c.wmiClient = wmiClient
 
 	// Test metric to verify collector is working
 	c.vhdxCollectorInfo = prometheus.NewDesc(
@@ -221,8 +227,9 @@ func (c *Collector) buildVirtualHardDisk(miSession *mi.Session) error {
 	}
 	c.vmQuery = vmQuery
 
-	// Create storage query string for WMI client
-	c.storageQuery = "SELECT ElementName, InstanceID, HostResource, Address, AddressOnParent, ResourceType, ResourceSubType FROM Msvm_StorageAllocationSettingData WHERE Parent IS NOT NULL"
+	// Create storage query string for WMI namespace queries
+	var testStorage []miStorageAllocationSettingData
+	c.storageQuery = wmi.CreateQuery(&testStorage, "WHERE Parent IS NOT NULL", "Msvm_StorageAllocationSettingData")
 
 	// Test the queries to make sure they work - following cpu_info.go pattern
 	hypervNamespace, err := mi.NewNamespace("root/virtualization/v2")
@@ -235,8 +242,7 @@ func (c *Collector) buildVirtualHardDisk(miSession *mi.Session) error {
 		return fmt.Errorf("VM WMI query failed: %w", err)
 	}
 
-	var testStorage []miStorageAllocationSettingData
-	if err := c.wmiClient.Query(c.storageQuery, &testStorage); err != nil {
+	if err := wmi.QueryNamespace(c.storageQuery, &testStorage, "root/virtualization/v2"); err != nil {
 		return fmt.Errorf("Storage WMI query failed: %w", err)
 	}
 
@@ -269,9 +275,9 @@ func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 
 	logger.Info("Found VMs", slog.Int("vm_count", len(vms)))
 
-	// Query storage allocation data using the persistent WMI client
+	// Query storage allocation data using WMI namespace query
 	var storageData []miStorageAllocationSettingData
-	if err := c.wmiClient.Query(c.storageQuery, &storageData); err != nil {
+	if err := wmi.QueryNamespace(c.storageQuery, &storageData, "root/virtualization/v2"); err != nil {
 		logger.Error("Storage WMI query failed", slog.Any("err", err))
 		return fmt.Errorf("Storage WMI query failed: %w", err)
 	}
@@ -345,6 +351,15 @@ func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 			controllerType, controllerNumber, controllerLocation := c.parseControllerInfo(storage.Address, storage.AddressOnParent)
 			vhdFilename := filepath.Base(hostResource)
 
+			// Query for detailed VHD information
+			vhdInfo, err := c.getVHDDetails(hostResource, logger)
+			if err != nil {
+				logger.Debug("Failed to get VHD details",
+					slog.String("vhd_path", hostResource),
+					slog.Any("err", err))
+				// Continue with limited information
+			}
+
 			// Emit the exists metric
 			ch <- prometheus.MustNewConstMetric(
 				c.vhdxExists,
@@ -352,6 +367,104 @@ func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 				1, // We found it
 				vmName, controllerType, controllerNumber, controllerLocation, hostResource, vhdFilename,
 			)
+
+			// Emit controller metrics
+			ch <- prometheus.MustNewConstMetric(
+				c.vhdxControllerNumber,
+				prometheus.GaugeValue,
+				parseStringToFloat(controllerNumber),
+				vmName, controllerType, hostResource, vhdFilename,
+			)
+
+			ch <- prometheus.MustNewConstMetric(
+				c.vhdxControllerLocation,
+				prometheus.GaugeValue,
+				parseStringToFloat(controllerLocation),
+				vmName, controllerType, hostResource, vhdFilename,
+			)
+
+			// Emit detailed VHD metrics if we have the data
+			vhdFormat := "Unknown"
+			vhdType := "Unknown"
+
+			if vhdInfo != nil {
+				vhdFormat = vhdInfo.VHDFormat
+				vhdType = vhdInfo.VHDType
+
+				ch <- prometheus.MustNewConstMetric(
+					c.vhdxSize,
+					prometheus.GaugeValue,
+					float64(vhdInfo.VirtualSize),
+					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
+				)
+
+				ch <- prometheus.MustNewConstMetric(
+					c.vhdxLogicalSectorSize,
+					prometheus.GaugeValue,
+					float64(vhdInfo.LogicalSectorSize),
+					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
+				)
+
+				ch <- prometheus.MustNewConstMetric(
+					c.vhdxPhysicalSectorSize,
+					prometheus.GaugeValue,
+					float64(vhdInfo.PhysicalSectorSize),
+					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
+				)
+
+				if vhdInfo.BlockSize > 0 {
+					ch <- prometheus.MustNewConstMetric(
+						c.vhdxBlockSize,
+						prometheus.GaugeValue,
+						float64(vhdInfo.BlockSize),
+						vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
+					)
+				}
+
+				ch <- prometheus.MustNewConstMetric(
+					c.vhdxFileSize,
+					prometheus.GaugeValue,
+					float64(vhdInfo.PhysicalSize),
+					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
+				)
+
+				// Use default values for metrics not available from go-winio/vhd
+				ch <- prometheus.MustNewConstMetric(
+					c.vhdxMinimumSize,
+					prometheus.GaugeValue,
+					0, // Not available from this API
+					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
+				)
+
+				ch <- prometheus.MustNewConstMetric(
+					c.vhdxAlignment,
+					prometheus.GaugeValue,
+					0, // Not available from this API
+					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
+				)
+
+				ch <- prometheus.MustNewConstMetric(
+					c.vhdxFragmentationPercentage,
+					prometheus.GaugeValue,
+					float64(vhdInfo.FragmentationPercentage),
+					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
+				)
+
+				// Use default values for boolean metrics not available from go-winio/vhd
+				ch <- prometheus.MustNewConstMetric(
+					c.vhdxAttached,
+					prometheus.GaugeValue,
+					0, // Not available from this API
+					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
+				)
+
+				ch <- prometheus.MustNewConstMetric(
+					c.vhdxIsPMEMCompatible,
+					prometheus.GaugeValue,
+					0, // Not available from this API
+					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
+				)
+			}
 
 			logger.Debug("Emitted VHD metric",
 				slog.String("vm_name", vmName),
@@ -424,6 +537,56 @@ func getVHDType(vhdType uint16) string {
 	default:
 		return "Unknown"
 	}
+}
+
+// getVHDDetails gets basic VHD information using the go-winio/vhd package and file system
+func (c *Collector) getVHDDetails(vhdPath string, logger *slog.Logger) (*VHDInfo, error) {
+	// Get file information
+	fileInfo, err := os.Stat(vhdPath)
+	if err != nil {
+		logger.Debug("Failed to get VHD file information",
+			slog.String("vhd_path", vhdPath),
+			slog.Any("err", err))
+		return nil, fmt.Errorf("failed to get VHD file information: %w", err)
+	}
+
+	// Determine VHD format from file extension
+	vhdFormat := "VHD"
+	if strings.HasSuffix(strings.ToLower(vhdPath), ".vhdx") {
+		vhdFormat = "VHDX"
+	}
+
+	// Try to open the VHD to validate it and get more info
+	handle, err := vhd.OpenVirtualDisk(vhdPath, vhd.VirtualDiskAccessGetInfo, vhd.OpenVirtualDiskFlagNone)
+	if err != nil {
+		logger.Debug("Failed to open VHD file for info",
+			slog.String("vhd_path", vhdPath),
+			slog.Any("err", err))
+		// Return basic info even if we can't open the VHD
+		return &VHDInfo{
+			Path:         vhdPath,
+			VHDFormat:    vhdFormat,
+			VHDType:      "Unknown",
+			PhysicalSize: uint64(fileInfo.Size()),
+			VirtualSize:  uint64(fileInfo.Size()), // Fallback to physical size
+		}, nil
+	}
+	defer syscall.CloseHandle(handle)
+
+	// Create VHD info structure with available information
+	vhdInfo := &VHDInfo{
+		Path:                    vhdPath,
+		VHDFormat:               vhdFormat,
+		VHDType:                 "Unknown", // We'll try to determine this from other sources
+		PhysicalSize:            uint64(fileInfo.Size()),
+		VirtualSize:             uint64(fileInfo.Size()), // Default to physical size, may be overridden
+		LogicalSectorSize:       512,                     // Standard default
+		PhysicalSectorSize:      512,                     // Standard default
+		BlockSize:               0,                       // Not available through this API
+		FragmentationPercentage: 100,                     // Conservative default (fully allocated)
+	}
+
+	return vhdInfo, nil
 }
 
 // Helper functions
