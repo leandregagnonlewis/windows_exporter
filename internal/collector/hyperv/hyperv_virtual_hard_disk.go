@@ -18,19 +18,20 @@
 package hyperv
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
-	"syscall"
 
-	"github.com/Microsoft/go-winio/vhd"
 	"github.com/prometheus-community/windows_exporter/internal/mi"
 	"github.com/prometheus-community/windows_exporter/internal/types"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/yusufpapurcu/wmi"
+	"golang.org/x/sys/windows"
 )
 
 // collectorVirtualHardDisk Hyper-V Virtual Hard Disk metrics
@@ -99,7 +100,7 @@ type miVirtualHardDiskState struct {
 	IsPMEMCompatible        bool   `mi:"IsPMEMCompatible"`
 }
 
-// VHDInfo contains information about a VHD file extracted using go-winio/vhd package
+// VHDInfo contains information about a VHD file extracted using file system and volume APIs
 type VHDInfo struct {
 	Path                    string
 	VirtualSize             uint64
@@ -110,6 +111,17 @@ type VHDInfo struct {
 	VHDType                 string
 	VHDFormat               string
 	FragmentationPercentage uint16
+	VolumeInfo              volumeInfo
+}
+
+// volumeInfo mirrors the logical_disk collector's volumeInfo struct
+type volumeInfo struct {
+	diskIDs      string
+	filesystem   string
+	serialNumber string
+	label        string
+	volumeType   string
+	readonly     float64
 }
 
 func (c *Collector) buildVirtualHardDisk(miSession *mi.Session) error {
@@ -428,18 +440,18 @@ func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
 				)
 
-				// Use default values for metrics not available from go-winio/vhd
+				// Use default values for metrics not available from file system APIs
 				ch <- prometheus.MustNewConstMetric(
 					c.vhdxMinimumSize,
 					prometheus.GaugeValue,
-					0, // Not available from this API
+					0, // Not available without VHD parsing
 					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
 				)
 
 				ch <- prometheus.MustNewConstMetric(
 					c.vhdxAlignment,
 					prometheus.GaugeValue,
-					0, // Not available from this API
+					0, // Not available without VHD parsing
 					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
 				)
 
@@ -450,19 +462,28 @@ func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
 				)
 
-				// Use default values for boolean metrics not available from go-winio/vhd
+				// Use default values for boolean metrics not available from file system APIs
 				ch <- prometheus.MustNewConstMetric(
 					c.vhdxAttached,
 					prometheus.GaugeValue,
-					0, // Not available from this API
+					0, // Not available without VHD parsing
 					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
 				)
 
 				ch <- prometheus.MustNewConstMetric(
 					c.vhdxIsPMEMCompatible,
 					prometheus.GaugeValue,
-					0, // Not available from this API
+					0, // Not available without VHD parsing
 					vmName, controllerType, hostResource, vhdFilename, vhdFormat, vhdType,
+				)
+
+				// Log volume information for debugging
+				logger.Debug("VHD volume information",
+					slog.String("vm_name", vmName),
+					slog.String("vhd_path", hostResource),
+					slog.String("filesystem", vhdInfo.VolumeInfo.filesystem),
+					slog.String("volume_type", vhdInfo.VolumeInfo.volumeType),
+					slog.String("disk_ids", vhdInfo.VolumeInfo.diskIDs),
 				)
 			}
 
@@ -539,7 +560,7 @@ func getVHDType(vhdType uint16) string {
 	}
 }
 
-// getVHDDetails gets basic VHD information using the go-winio/vhd package and file system
+// getVHDDetails gets VHD information using file system APIs and volume information
 func (c *Collector) getVHDDetails(vhdPath string, logger *slog.Logger) (*VHDInfo, error) {
 	// Get file information
 	fileInfo, err := os.Stat(vhdPath)
@@ -556,42 +577,218 @@ func (c *Collector) getVHDDetails(vhdPath string, logger *slog.Logger) (*VHDInfo
 		vhdFormat = "VHDX"
 	}
 
-	// Try to open the VHD to validate it and get more info
-	// Use the same flags as the examples in the go-winio package
-	handle, err := vhd.OpenVirtualDisk(vhdPath, vhd.VirtualDiskAccessGetInfo, vhd.OpenVirtualDiskFlagCachedIO|vhd.OpenVirtualDiskFlagIgnoreRelativeParentLocator)
-	if err != nil {
-		logger.Debug("Failed to open VHD file for info",
-			slog.String("vhd_path", vhdPath),
-			slog.Any("err", err))
-		// Return basic info even if we can't open the VHD
-		return &VHDInfo{
-			Path:                    vhdPath,
-			VHDFormat:               vhdFormat,
-			VHDType:                 "Unknown",
-			PhysicalSize:            uint64(fileInfo.Size()),
-			VirtualSize:             uint64(fileInfo.Size()), // Fallback to physical size
-			LogicalSectorSize:       512,                     // Standard default
-			PhysicalSectorSize:      512,                     // Standard default
-			BlockSize:               0,                       // Not available through this API
-			FragmentationPercentage: 100,                     // Conservative default (fully allocated)
-		}, nil
+	// Extract drive letter from VHD path for volume information
+	driveLetter := filepath.VolumeName(vhdPath)
+	if driveLetter == "" {
+		// Fallback: try to extract drive letter manually
+		if len(vhdPath) >= 2 && vhdPath[1] == ':' {
+			driveLetter = vhdPath[:2]
+		}
 	}
-	defer syscall.CloseHandle(handle)
+
+	// Get volume information for the drive containing the VHD
+	var volInfo volumeInfo
+	if driveLetter != "" {
+		volumes, err := getAllMountedVolumes()
+		if err != nil {
+			logger.Debug("Failed to get mounted volumes",
+				slog.String("vhd_path", vhdPath),
+				slog.Any("err", err))
+		} else {
+			volInfo, err = getVolumeInfo(volumes, driveLetter)
+			if err != nil {
+				logger.Debug("Failed to get volume information",
+					slog.String("drive", driveLetter),
+					slog.Any("err", err))
+				// Continue with empty volume info
+			}
+		}
+	}
 
 	// Create VHD info structure with available information
 	vhdInfo := &VHDInfo{
 		Path:                    vhdPath,
 		VHDFormat:               vhdFormat,
-		VHDType:                 "Unknown", // We'll try to determine this from other sources
+		VHDType:                 "Unknown", // Can't determine without opening VHD
 		PhysicalSize:            uint64(fileInfo.Size()),
-		VirtualSize:             uint64(fileInfo.Size()), // Default to physical size, may be overridden
+		VirtualSize:             uint64(fileInfo.Size()), // Default to physical size
 		LogicalSectorSize:       512,                     // Standard default
 		PhysicalSectorSize:      512,                     // Standard default
-		BlockSize:               0,                       // Not available through this API
+		BlockSize:               0,                       // Not available without VHD parsing
 		FragmentationPercentage: 100,                     // Conservative default (fully allocated)
+		VolumeInfo:              volInfo,
 	}
 
 	return vhdInfo, nil
+}
+
+// getAllMountedVolumes returns a map of mounted volumes (adapted from logical_disk collector)
+func getAllMountedVolumes() (map[string]string, error) {
+	guidBuf := make([]uint16, windows.MAX_PATH+1)
+	guidBufLen := uint32(len(guidBuf) * 2)
+
+	hFindVolume, err := windows.FindFirstVolume(&guidBuf[0], guidBufLen)
+	if err != nil {
+		return nil, fmt.Errorf("FindFirstVolume: %w", err)
+	}
+
+	defer func() {
+		_ = windows.FindVolumeClose(hFindVolume)
+	}()
+
+	volumes := map[string]string{}
+
+	for ; ; err = windows.FindNextVolume(hFindVolume, &guidBuf[0], guidBufLen) {
+		if err != nil {
+			if err == windows.ERROR_NO_MORE_FILES {
+				return volumes, nil
+			}
+			return nil, fmt.Errorf("FindNextVolume: %w", err)
+		}
+
+		var rootPathLen uint32
+		rootPathBuf := make([]uint16, windows.MAX_PATH+1)
+		rootPathBufLen := uint32(len(rootPathBuf) * 2)
+
+		for {
+			err = windows.GetVolumePathNamesForVolumeName(&guidBuf[0], &rootPathBuf[0], rootPathBufLen, &rootPathLen)
+			if err == nil {
+				break
+			}
+
+			if err == windows.ERROR_FILE_NOT_FOUND {
+				// the volume is not mounted
+				break
+			}
+
+			if err == windows.ERROR_MORE_DATA {
+				rootPathBuf = make([]uint16, (rootPathLen+1)/2)
+				continue
+			}
+
+			return nil, fmt.Errorf("GetVolumePathNamesForVolumeName: %w", err)
+		}
+
+		mountPoint := windows.UTF16ToString(rootPathBuf)
+
+		// Skip unmounted volumes
+		if len(mountPoint) == 0 {
+			continue
+		}
+
+		volumes[strings.TrimSuffix(mountPoint, `\`)] = strings.TrimSuffix(windows.UTF16ToString(guidBuf), `\`)
+	}
+}
+
+// getVolumeInfo returns volume information for a given drive (adapted from logical_disk collector)
+func getVolumeInfo(volumes map[string]string, rootDrive string) (volumeInfo, error) {
+	volumePath := rootDrive
+
+	// If rootDrive is a NTFS directory, convert it to a volume GUID.
+	if volumeGUID, ok := volumes[rootDrive]; ok {
+		volumePath, _ = strings.CutPrefix(volumeGUID, `\\?\`)
+	}
+
+	volumePathPtr := windows.StringToUTF16Ptr(`\\.\` + volumePath)
+
+	// mode has to include FILE_SHARE permission to allow concurrent access to the disk.
+	// use 0 as access mode to avoid admin permission.
+	mode := uint32(windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE)
+	attr := uint32(windows.FILE_ATTRIBUTE_READONLY)
+
+	volumeHandle, err := windows.CreateFile(volumePathPtr, 0, mode, nil, windows.OPEN_EXISTING, attr, 0)
+	if err != nil {
+		return volumeInfo{}, fmt.Errorf("could not open volume for %s: %w", rootDrive, err)
+	}
+
+	defer func(fd windows.Handle) {
+		_ = windows.Close(fd)
+	}(volumeHandle)
+
+	controlCode := uint32(5636096) // IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS
+	volumeDiskExtents := make([]byte, 16*1024)
+
+	var bytesReturned uint32
+
+	err = windows.DeviceIoControl(volumeHandle, controlCode, nil, 0, &volumeDiskExtents[0], uint32(len(volumeDiskExtents)), &bytesReturned, nil)
+	if err != nil {
+		return volumeInfo{}, fmt.Errorf("could not identify physical drive for %s: %w", rootDrive, err)
+	}
+
+	numDiskIDs := uint(binary.LittleEndian.Uint32(volumeDiskExtents))
+	if numDiskIDs < 1 {
+		return volumeInfo{}, fmt.Errorf("could not identify physical drive for %s: no disk IDs returned", rootDrive)
+	}
+
+	diskIDs := make([]string, numDiskIDs)
+
+	// diskExtentSize Size of the DiskExtent structure in bytes.
+	const diskExtentSize = 24
+
+	for i := range numDiskIDs {
+		diskIDs[i] = strconv.FormatUint(uint64(binary.LittleEndian.Uint32(volumeDiskExtents[8+i*diskExtentSize:])), 10)
+	}
+
+	slices.Sort(diskIDs)
+	diskIDs = slices.Compact(diskIDs)
+
+	volumeInformationRootDrive := volumePath + `\`
+
+	if strings.Contains(volumePath, `Volume`) {
+		volumeInformationRootDrive = `\\?\` + volumeInformationRootDrive
+	}
+
+	volumeInformationRootDrivePtr := windows.StringToUTF16Ptr(volumeInformationRootDrive)
+	driveType := windows.GetDriveType(volumeInformationRootDrivePtr)
+	volBufLabel := make([]uint16, windows.MAX_PATH+1)
+	volSerialNum := uint32(0)
+	fsFlags := uint32(0)
+	volBufType := make([]uint16, windows.MAX_PATH+1)
+
+	err = windows.GetVolumeInformation(
+		volumeInformationRootDrivePtr,
+		&volBufLabel[0], uint32(len(volBufLabel)),
+		&volSerialNum, nil, &fsFlags,
+		&volBufType[0], uint32(len(volBufType)),
+	)
+	if err != nil {
+		if driveType == windows.DRIVE_CDROM || driveType == windows.DRIVE_REMOVABLE {
+			return volumeInfo{}, nil
+		}
+
+		return volumeInfo{}, fmt.Errorf("could not get volume information for %s: %w", volumeInformationRootDrive, err)
+	}
+
+	return volumeInfo{
+		diskIDs:      strings.Join(diskIDs, ";"),
+		volumeType:   getDriveType(driveType),
+		label:        windows.UTF16PtrToString(&volBufLabel[0]),
+		filesystem:   windows.UTF16PtrToString(&volBufType[0]),
+		serialNumber: fmt.Sprintf("%X", volSerialNum),
+		readonly:     float64(fsFlags & windows.FILE_READ_ONLY_VOLUME),
+	}, nil
+}
+
+// getDriveType converts Windows drive type to string (adapted from logical_disk collector)
+func getDriveType(driveType uint32) string {
+	switch driveType {
+	case windows.DRIVE_UNKNOWN:
+		return "unknown"
+	case windows.DRIVE_NO_ROOT_DIR:
+		return "norootdir"
+	case windows.DRIVE_REMOVABLE:
+		return "removable"
+	case windows.DRIVE_FIXED:
+		return "fixed"
+	case windows.DRIVE_REMOTE:
+		return "remote"
+	case windows.DRIVE_CDROM:
+		return "cdrom"
+	case windows.DRIVE_RAMDISK:
+		return "ramdisk"
+	default:
+		return "unknown"
+	}
 }
 
 // Helper functions
