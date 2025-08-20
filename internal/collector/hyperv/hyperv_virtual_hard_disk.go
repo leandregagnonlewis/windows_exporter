@@ -557,18 +557,23 @@ func (c *Collector) getVHDDetails(vhdPath string, logger *slog.Logger) (*VHDInfo
 	}
 
 	// Try to open the VHD to validate it and get more info
-	handle, err := vhd.OpenVirtualDisk(vhdPath, vhd.VirtualDiskAccessGetInfo, vhd.OpenVirtualDiskFlagNone)
+	// Use the same flags as the examples in the go-winio package
+	handle, err := vhd.OpenVirtualDisk(vhdPath, vhd.VirtualDiskAccessGetInfo, vhd.OpenVirtualDiskFlagCachedIO|vhd.OpenVirtualDiskFlagIgnoreRelativeParentLocator)
 	if err != nil {
 		logger.Debug("Failed to open VHD file for info",
 			slog.String("vhd_path", vhdPath),
 			slog.Any("err", err))
 		// Return basic info even if we can't open the VHD
 		return &VHDInfo{
-			Path:         vhdPath,
-			VHDFormat:    vhdFormat,
-			VHDType:      "Unknown",
-			PhysicalSize: uint64(fileInfo.Size()),
-			VirtualSize:  uint64(fileInfo.Size()), // Fallback to physical size
+			Path:                    vhdPath,
+			VHDFormat:               vhdFormat,
+			VHDType:                 "Unknown",
+			PhysicalSize:            uint64(fileInfo.Size()),
+			VirtualSize:             uint64(fileInfo.Size()), // Fallback to physical size
+			LogicalSectorSize:       512,                     // Standard default
+			PhysicalSectorSize:      512,                     // Standard default
+			BlockSize:               0,                       // Not available through this API
+			FragmentationPercentage: 100,                     // Conservative default (fully allocated)
 		}, nil
 	}
 	defer syscall.CloseHandle(handle)
