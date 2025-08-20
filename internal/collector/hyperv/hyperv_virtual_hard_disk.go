@@ -27,15 +27,16 @@ import (
 	"github.com/prometheus-community/windows_exporter/internal/mi"
 	"github.com/prometheus-community/windows_exporter/internal/types"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/yusufpapurcu/wmi"
 )
 
 // collectorVirtualHardDisk Hyper-V Virtual Hard Disk metrics
 type collectorVirtualHardDisk struct {
 	miSession *mi.Session
-	
+
 	// MI queries
 	vmQuery      mi.Query
-	storageQuery mi.Query
+	storageQuery string
 
 	// Test metric
 	vhdxCollectorInfo *prometheus.Desc
@@ -211,10 +212,8 @@ func (c *Collector) buildVirtualHardDisk(miSession *mi.Session) error {
 	c.vmQuery = vmQuery
 
 	// Simpler storage query without LIKE operator that may not be supported
-	storageQuery, err := mi.NewQuery("SELECT InstanceID, HostResource, Address, AddressOnParent, ResourceType, ResourceSubType FROM Msvm_StorageAllocationSettingData")
-	if err != nil {
-		return fmt.Errorf("failed to create storage query: %w", err)
-	}
+	var testVMs []miVirtualSystemSettingData
+	storageQuery := wmi.CreateQuery("testVMS", "Parent IS NOT NULL", "VirtualSystemSettingData")
 	c.storageQuery = storageQuery
 
 	// Test the queries to make sure they work - following cpu_info.go pattern
@@ -223,13 +222,12 @@ func (c *Collector) buildVirtualHardDisk(miSession *mi.Session) error {
 		return fmt.Errorf("failed to create Hyper-V namespace: %w", err)
 	}
 
-	var testVMs []miVirtualSystemSettingData
 	if err := c.miSession.Query(&testVMs, hypervNamespace, c.vmQuery); err != nil {
 		return fmt.Errorf("VM WMI query failed: %w", err)
 	}
 
 	var testStorage []miStorageAllocationSettingData
-	if err := c.miSession.Query(&testStorage, hypervNamespace, c.storageQuery); err != nil {
+	if err := wmi.QueryNamespace(c.storageQuery, &testStorage, "root/virtualization/v2"); err != nil {
 		return fmt.Errorf("Storage WMI query failed: %w", err)
 	}
 
@@ -238,7 +236,7 @@ func (c *Collector) buildVirtualHardDisk(miSession *mi.Session) error {
 
 func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 	logger := slog.With(slog.String("collector", Name+":"+subCollectorVirtualHardDisk))
-	
+
 	// Always emit test metric
 	ch <- prometheus.MustNewConstMetric(
 		c.vhdxCollectorInfo,
@@ -264,7 +262,7 @@ func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 
 	// Query storage allocation data using the prepared query
 	var storageData []miStorageAllocationSettingData
-	if err := c.miSession.Query(&storageData, hypervNamespace, c.storageQuery); err != nil {
+	if err := wmi.QueryNamespace(c.storageQuery, &storageData, "root/virtualization/v2"); err != nil {
 		logger.Error("Storage WMI query failed", slog.Any("err", err))
 		return fmt.Errorf("Storage WMI query failed: %w", err)
 	}
@@ -275,7 +273,7 @@ func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 	vmMap := make(map[string]string)
 	for _, vm := range vms {
 		vmMap[vm.InstanceID] = vm.ElementName
-		logger.Debug("VM mapping", 
+		logger.Debug("VM mapping",
 			slog.String("instance_id", vm.InstanceID),
 			slog.String("vm_name", vm.ElementName),
 		)
@@ -286,14 +284,14 @@ func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 		// Skip storage instances that don't have VHD files
 		hasVHD := false
 		for _, hostResource := range storage.HostResource {
-			if hostResource != "" && 
-			   (strings.HasSuffix(strings.ToLower(hostResource), ".vhdx") || 
-			    strings.HasSuffix(strings.ToLower(hostResource), ".vhd")) {
+			if hostResource != "" &&
+				(strings.HasSuffix(strings.ToLower(hostResource), ".vhdx") ||
+					strings.HasSuffix(strings.ToLower(hostResource), ".vhd")) {
 				hasVHD = true
 				break
 			}
 		}
-		
+
 		if !hasVHD {
 			continue
 		}
@@ -301,11 +299,11 @@ func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 		// Find which VM this storage belongs to
 		var vmName string
 		var vmInstanceID string
-		
+
 		for instanceID, name := range vmMap {
 			// Check if the storage InstanceID contains the VM's GUID
-			if strings.Contains(storage.InstanceID, instanceID) || 
-			   strings.Contains(storage.InstanceID, strings.TrimPrefix(instanceID, "Microsoft:")) {
+			if strings.Contains(storage.InstanceID, instanceID) ||
+				strings.Contains(storage.InstanceID, strings.TrimPrefix(instanceID, "Microsoft:")) {
 				vmName = name
 				vmInstanceID = instanceID
 				break
@@ -313,7 +311,7 @@ func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 		}
 
 		if vmName == "" {
-			logger.Debug("Could not match storage to VM", 
+			logger.Debug("Could not match storage to VM",
 				slog.String("storage_instance_id", storage.InstanceID),
 			)
 			continue
@@ -322,9 +320,9 @@ func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 		// Process each HostResource (VHD path)
 		for _, hostResource := range storage.HostResource {
 			// Check if this is a VHD file
-			if hostResource == "" || 
-			   (!strings.HasSuffix(strings.ToLower(hostResource), ".vhdx") && 
-			    !strings.HasSuffix(strings.ToLower(hostResource), ".vhd")) {
+			if hostResource == "" ||
+				(!strings.HasSuffix(strings.ToLower(hostResource), ".vhdx") &&
+					!strings.HasSuffix(strings.ToLower(hostResource), ".vhd")) {
 				continue
 			}
 
@@ -357,7 +355,7 @@ func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 		slog.Int("vm_count", len(vms)),
 		slog.Int("storage_count", len(storageData)),
 	)
-	
+
 	return nil
 }
 

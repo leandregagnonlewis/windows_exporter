@@ -12,6 +12,7 @@ require (
 	github.com/prometheus/common v0.65.0
 	github.com/prometheus/exporter-toolkit v0.14.0
 	github.com/stretchr/testify v1.10.0
+	github.com/yusufpapurcu/wmi v1.2.4
 	golang.org/x/sys v0.35.0
 	gopkg.in/yaml.v3 v3.0.1
 )
