@@ -34,6 +34,9 @@ import (
 type collectorVirtualHardDisk struct {
 	miSession *mi.Session
 
+	// WMI session for persistent connection
+	wmiClient *wmi.SWbemServices
+
 	// MI queries
 	vmQuery      mi.Query
 	storageQuery string
@@ -103,6 +106,13 @@ func (c *Collector) buildVirtualHardDisk(miSession *mi.Session) error {
 
 	// Store the MI session for use in collection
 	c.miSession = miSession
+
+	// Initialize persistent WMI client for Hyper-V namespace
+	wmiClient, err := wmi.InitializeSWbemServices(wmi.DefaultClient, "root/virtualization/v2")
+	if err != nil {
+		return fmt.Errorf("failed to initialize WMI client: %w", err)
+	}
+	c.wmiClient = wmiClient
 
 	// Test metric to verify collector is working
 	c.vhdxCollectorInfo = prometheus.NewDesc(
@@ -211,10 +221,8 @@ func (c *Collector) buildVirtualHardDisk(miSession *mi.Session) error {
 	}
 	c.vmQuery = vmQuery
 
-	// Simpler storage query without LIKE operator that may not be supported
-	var testVMs []miStorageAllocationSettingData
-	storageQuery := wmi.CreateQuery(testVMs, "WHERE Parent IS NOT NULL", "Msvm_StorageAllocationSettingData")
-	c.storageQuery = storageQuery
+	// Create storage query string for WMI client
+	c.storageQuery = "SELECT ElementName, InstanceID, HostResource, Address, AddressOnParent, ResourceType, ResourceSubType FROM Msvm_StorageAllocationSettingData WHERE Parent IS NOT NULL"
 
 	// Test the queries to make sure they work - following cpu_info.go pattern
 	hypervNamespace, err := mi.NewNamespace("root/virtualization/v2")
@@ -222,12 +230,13 @@ func (c *Collector) buildVirtualHardDisk(miSession *mi.Session) error {
 		return fmt.Errorf("failed to create Hyper-V namespace: %w", err)
 	}
 
+	var testVMs []miVirtualSystemSettingData
 	if err := c.miSession.Query(&testVMs, hypervNamespace, c.vmQuery); err != nil {
 		return fmt.Errorf("VM WMI query failed: %w", err)
 	}
 
 	var testStorage []miStorageAllocationSettingData
-	if err := wmi.QueryNamespace(c.storageQuery, &testStorage, "root/virtualization/v2"); err != nil {
+	if err := c.wmiClient.Query(c.storageQuery, &testStorage); err != nil {
 		return fmt.Errorf("Storage WMI query failed: %w", err)
 	}
 
@@ -260,9 +269,9 @@ func (c *Collector) collectVirtualHardDisk(ch chan<- prometheus.Metric) error {
 
 	logger.Info("Found VMs", slog.Int("vm_count", len(vms)))
 
-	// Query storage allocation data using the prepared query
+	// Query storage allocation data using the persistent WMI client
 	var storageData []miStorageAllocationSettingData
-	if err := wmi.QueryNamespace(c.storageQuery, &storageData, "root/virtualization/v2"); err != nil {
+	if err := c.wmiClient.Query(c.storageQuery, &storageData); err != nil {
 		logger.Error("Storage WMI query failed", slog.Any("err", err))
 		return fmt.Errorf("Storage WMI query failed: %w", err)
 	}
